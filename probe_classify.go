@@ -1,0 +1,227 @@
+package main
+
+import "time"
+
+const (
+	probeSkewTolerance          = 120 * time.Second
+	probeActivationVerifyDelay  = 5 * time.Second
+	probeAnchoredResetTolerance = 2 * time.Second
+	probeMaxPlausibleWindow     = 120 * 24 * time.Hour
+	probeUnknownResetRecheck    = 30 * time.Minute
+	probeRefreshAfterResetDelay = time.Minute
+)
+
+// resetAnchoredAfterActivation distinguishes a newly anchored quota window
+// from a lazy projection. A lazy reset moves forward with the observation
+// clock; an activated reset remains fixed. This narrow, send-scoped check must
+// not reuse the broad clock-skew tolerance used for observations across hosts.
+func resetAnchoredAfterActivation(base ProbeBaseline, snap QuotaSnapshot, sendStartedAt, sendCompletedAt, observedAt time.Time) bool {
+	if !base.SuspectedLazy || !snap.Valid || snap.ResetAt == nil || snap.Usage == nil || sendStartedAt.IsZero() || sendCompletedAt.IsZero() || observedAt.IsZero() {
+		return false
+	}
+	length := base.WindowLength
+	if length <= 0 && snap.WindowLengthKnown {
+		length = snap.WindowLength
+	}
+	if length <= 0 {
+		return false
+	}
+	if sendCompletedAt.Before(sendStartedAt) || observedAt.Sub(sendCompletedAt) < probeActivationVerifyDelay-probeAnchoredResetTolerance {
+		return false
+	}
+	if !snap.ResetAt.After(observedAt) {
+		return false
+	}
+	// Upstream anchors the window while the activation request is in flight,
+	// not at the precheck that projected the lazy reset, so the fixed reset
+	// lands one window length after some instant between send start and send
+	// completion - a gap the old comparison against the precheck projection
+	// misread as "still lazy" whenever the request took more than the
+	// tolerance. A reset that still slides sits one window length after the
+	// verify read, which is probeActivationVerifyDelay past send completion
+	// and therefore outside this interval.
+	earliest := sendStartedAt.Add(length).Add(-probeAnchoredResetTolerance)
+	latest := sendCompletedAt.Add(length).Add(probeAnchoredResetTolerance)
+	return !snap.ResetAt.Before(earliest) && !snap.ResetAt.After(latest)
+}
+
+type ProbeBaselineKind string
+
+const (
+	ProbeBaselineNone      ProbeBaselineKind = ""
+	ProbeBaselineReset     ProbeBaselineKind = "reset"
+	ProbeBaselineUsageOnly ProbeBaselineKind = "usage_only"
+)
+
+type ProbeBaseline struct {
+	Kind            ProbeBaselineKind `json:"kind"`
+	WindowKind      WindowKind        `json:"window_kind,omitempty"`
+	ResetAt         time.Time         `json:"reset_at,omitempty"`
+	Usage           float64           `json:"usage"`
+	NextRecheckAt   time.Time         `json:"next_recheck_at,omitempty"`
+	WindowLength    time.Duration     `json:"window_length,omitempty"`
+	CandidateLength time.Duration     `json:"candidate_length,omitempty"`
+	StableIntervals int               `json:"stable_intervals,omitempty"`
+	SuspectedLazy   bool              `json:"suspected_lazy,omitempty"`
+}
+
+func ResetProbeBaseline(reset time.Time, usage float64, length time.Duration) ProbeBaseline {
+	return ProbeBaseline{Kind: ProbeBaselineReset, ResetAt: reset, Usage: usage, WindowLength: length}
+}
+func UsageOnlyProbeBaseline(usage float64, next time.Time) ProbeBaseline {
+	return ProbeBaseline{Kind: ProbeBaselineUsageOnly, Usage: usage, NextRecheckAt: next}
+}
+
+type QuotaSnapshot struct {
+	Valid             bool
+	ResetAt           *time.Time
+	Usage             *float64
+	WindowKind        WindowKind
+	WindowLength      time.Duration
+	WindowLengthKnown bool
+}
+type ProbeClassificationKind string
+
+const (
+	ProbeInvalid           ProbeClassificationKind = "invalid"
+	ProbeActivatedNew      ProbeClassificationKind = "activated_new"
+	ProbeActivatedInferred ProbeClassificationKind = "activated_inferred"
+	ProbeNotDueYet         ProbeClassificationKind = "not_due_yet"
+	ProbeStillLazy         ProbeClassificationKind = "still_lazy"
+	ProbeAmbiguous         ProbeClassificationKind = "ambiguous"
+	ProbeAnomaly           ProbeClassificationKind = "anomaly"
+)
+
+type ProbeClassification struct {
+	Kind          ProbeClassificationKind
+	Baseline      ProbeBaseline
+	LengthUnknown bool
+}
+
+func ClassifyProbeWindow(base ProbeBaseline, snap QuotaSnapshot, now time.Time) ProbeClassification {
+	if !snap.Valid || snap.Usage == nil {
+		return ProbeClassification{Kind: ProbeInvalid, Baseline: base}
+	}
+	if base.SuspectedLazy {
+		if snap.ResetAt != nil && snap.ResetAt.Before(base.ResetAt.Add(-probeSkewTolerance)) {
+			return ProbeClassification{Kind: ProbeAnomaly, Baseline: base}
+		}
+		if snap.ResetAt != nil {
+			delta := snap.ResetAt.Sub(base.ResetAt)
+			if base.WindowLength > 0 && delta > 2*base.WindowLength {
+				return ProbeClassification{Kind: ProbeAnomaly, Baseline: base}
+			}
+			if base.WindowLength == 0 && delta > probeMaxPlausibleWindow {
+				return ProbeClassification{Kind: ProbeAnomaly, Baseline: base}
+			}
+		}
+		if snap.ResetAt != nil && snap.ResetAt.After(base.ResetAt.Add(probeSkewTolerance)) {
+			base.ResetAt = *snap.ResetAt
+			base.Usage = *snap.Usage
+			base.SuspectedLazy = false
+			return ProbeClassification{Kind: ProbeActivatedNew, Baseline: base}
+		}
+		if *snap.Usage > 0 {
+			base.Usage = *snap.Usage
+			base.SuspectedLazy = false
+			return ProbeClassification{Kind: ProbeActivatedInferred, Baseline: base}
+		}
+		if snap.ResetAt != nil && absDuration(snap.ResetAt.Sub(base.ResetAt)) <= probeSkewTolerance {
+			return ProbeClassification{Kind: ProbeStillLazy, Baseline: base}
+		}
+	}
+	if base.Kind == ProbeBaselineNone {
+		if snap.ResetAt == nil {
+			return ProbeClassification{Kind: ProbeNotDueYet, Baseline: UsageOnlyProbeBaseline(*snap.Usage, now.Add(probeUnknownResetRecheck))}
+		}
+		n := ResetProbeBaseline(*snap.ResetAt, *snap.Usage, 0)
+		n.WindowKind = snap.WindowKind
+		if snap.WindowLengthKnown {
+			n.WindowLength = snap.WindowLength
+		}
+		if snap.ResetAt.After(now) {
+			return ProbeClassification{Kind: ProbeNotDueYet, Baseline: n}
+		}
+		return ProbeClassification{Kind: ProbeStillLazy, Baseline: n}
+	}
+	if base.Kind == ProbeBaselineUsageOnly {
+		if snap.ResetAt != nil {
+			n := ResetProbeBaseline(*snap.ResetAt, *snap.Usage, 0)
+			n.WindowKind = snap.WindowKind
+			if snap.WindowLengthKnown {
+				n.WindowLength = snap.WindowLength
+			}
+			if snap.ResetAt.After(now) {
+				return ProbeClassification{Kind: ProbeNotDueYet, Baseline: n}
+			}
+			return ProbeClassification{Kind: ProbeStillLazy, Baseline: n}
+		}
+		if usageActivated(base.Usage, *snap.Usage) {
+			base.Usage = *snap.Usage
+			base.NextRecheckAt = now.Add(probeUnknownResetRecheck)
+			base.SuspectedLazy = false
+			return ProbeClassification{Kind: ProbeActivatedInferred, Baseline: base}
+		}
+		if now.Before(base.NextRecheckAt) {
+			return ProbeClassification{Kind: ProbeNotDueYet, Baseline: base}
+		}
+		base.NextRecheckAt = now.Add(probeUnknownResetRecheck)
+		return ProbeClassification{Kind: ProbeNotDueYet, Baseline: base}
+	}
+	if snap.ResetAt != nil && snap.ResetAt.Before(base.ResetAt.Add(-probeSkewTolerance)) {
+		return ProbeClassification{Kind: ProbeAnomaly, Baseline: base}
+	}
+	if snap.ResetAt != nil {
+		delta := snap.ResetAt.Sub(base.ResetAt)
+		if base.WindowLength > 0 && delta > 2*base.WindowLength {
+			return ProbeClassification{Kind: ProbeAnomaly, Baseline: base}
+		}
+		if base.WindowLength == 0 && delta > probeMaxPlausibleWindow {
+			return ProbeClassification{Kind: ProbeAnomaly, Baseline: base}
+		}
+		if snap.ResetAt.After(base.ResetAt.Add(probeSkewTolerance)) {
+			n := base
+			n.ResetAt = *snap.ResetAt
+			n.Usage = *snap.Usage
+			n.SuspectedLazy = false
+			if n.WindowLength == 0 {
+				if n.CandidateLength > 0 && absDuration(n.CandidateLength-delta) <= probeSkewTolerance {
+					n.StableIntervals++
+					if n.StableIntervals >= 2 {
+						n.WindowLength = delta
+					}
+				} else {
+					n.CandidateLength = delta
+					n.StableIntervals = 1
+				}
+			}
+			return ProbeClassification{Kind: ProbeActivatedNew, Baseline: n, LengthUnknown: n.WindowLength == 0}
+		}
+	}
+	if now.Before(base.ResetAt.Add(probeRefreshAfterResetDelay)) {
+		return ProbeClassification{Kind: ProbeNotDueYet, Baseline: base}
+	}
+	if snap.ResetAt == nil {
+		if usageActivated(base.Usage, *snap.Usage) {
+			base.Usage = *snap.Usage
+			base.SuspectedLazy = false
+			return ProbeClassification{Kind: ProbeActivatedInferred, Baseline: base}
+		}
+		if *snap.Usage == base.Usage {
+			return ProbeClassification{Kind: ProbeAmbiguous, Baseline: base}
+		}
+		return ProbeClassification{Kind: ProbeAmbiguous, Baseline: base}
+	}
+	if absDuration(snap.ResetAt.Sub(base.ResetAt)) <= probeSkewTolerance && !usageActivated(base.Usage, *snap.Usage) {
+		return ProbeClassification{Kind: ProbeStillLazy, Baseline: base}
+	}
+	return ProbeClassification{Kind: ProbeAmbiguous, Baseline: base}
+}
+func looksLikeStrictLazyObservation(observedAt time.Time, window QuotaWindow, length time.Duration) bool {
+	if window.UsedPercent == nil || *window.UsedPercent != 0 || observedAt.IsZero() || window.ResetAt.IsZero() || length <= 0 {
+		return false
+	}
+	return absDuration(window.ResetAt.Sub(observedAt.Add(length))) <= resetProbeCloseThreshold
+}
+
+func usageActivated(old, new float64) bool { return old > 0 && new == 0 }

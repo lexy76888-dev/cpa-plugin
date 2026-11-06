@@ -1,0 +1,32 @@
+# Build outputs
+build/
+dist/
+.worktrees/
+*.exe
+*.dll
+*.so
+*.dylib
+# c-shared also emits a companion header next to the library
+*.h
+*.test
+
+# Test artifacts
+coverage.out
+*.prof
+
+# Local plugin state
+cpa-quota.state.json
+*.annotations.json
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# 私有配置与本机验证资料
+artifacts/
+.local/
+config.json
+*.secret
+.env
