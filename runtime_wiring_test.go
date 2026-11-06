@@ -53,13 +53,13 @@ func TestRuntimeAndUserArtifactsNeverPersistSensitiveValues(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, suffix := range []string{".tmp", ".corrupt", ".migrated"} {
+		for _, suffix := range []string{".tmp", ".corrupt"} {
 			if err := os.WriteFile(base+suffix, primary, 0600); err != nil {
 				t.Fatal(err)
 			}
 		}
 	}
-	for _, suffix := range []string{"", ".bak", ".tmp", ".corrupt", ".migrated"} {
+	for _, suffix := range []string{"", ".bak", ".tmp", ".corrupt"} {
 		for _, base := range []string{paths.Runtime, paths.UserData} {
 			raw, err := os.ReadFile(base + suffix)
 			if errors.Is(err, os.ErrNotExist) {
@@ -1658,22 +1658,21 @@ func TestStateStoreDualCorruptionPreservesBothEvidenceAndFences(t *testing.T) {
 	}
 }
 
-func TestUserDataSchemaMigrationAndCorruptionEvidence(t *testing.T) {
+func TestUserDataUnsupportedSchemaAndCorruptionEvidence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), ".user-data.json")
 	if err := os.WriteFile(path, []byte(`{"schema_version":0,"config":{},"accounts":{"a":{"alias":"old"}}}`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	got, loaded, err := loadUserData(path)
-	if err != nil || !loaded || got.Accounts["a"].Alias != "old" {
-		t.Fatalf("got=%#v loaded=%v err=%v", got, loaded, err)
+	original, _ := os.ReadFile(path)
+	if _, _, err := loadUserData(path); !errors.Is(err, ErrUserDataSchema) {
+		t.Fatalf("unsupported schema err=%v", err)
 	}
 	raw, _ := os.ReadFile(path)
-	var env struct {
-		SchemaVersion int `json:"schema_version"`
+	if !reflect.DeepEqual(raw, original) {
+		t.Fatal("unsupported schema rewritten")
 	}
-	json.Unmarshal(raw, &env)
-	if env.SchemaVersion != CurrentUserDataSchema {
-		t.Fatalf("schema=%d raw=%s", env.SchemaVersion, raw)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
 	}
 	if err := SaveUserData(path, PluginDiskState{Config: DefaultConfig(), Accounts: map[string]AccountAnnotation{"a": {Alias: "new"}}}); err != nil {
 		t.Fatal(err)
@@ -1721,14 +1720,7 @@ func TestUserDataFutureSchemaFailsSafeAndDualCorruptionPreservesEvidence(t *test
 func intPtr(v int) *int { return &v }
 
 func TestSuiteRuntimeWiring(t *testing.T) {
-	t.Run("semantic migration", TestRuntimeSemanticPathsAndLegacyMigration)
-	t.Run("corrupt legacy", TestRuntimeCorruptLegacyIsPreserved)
-	t.Run("strict legacy", TestLegacyMigrationRejectsSensitiveAndUnknownFieldsWithoutRename)
-	t.Run("legacy value secrets", TestLegacyMigrationRejectsCredentialSyntaxInsideAllowedStringValues)
-	t.Run("benign token text", TestLegacyMigrationAllowsBenignTokenMentionAndScansRealArtifact)
-	t.Run("actual migrated scan", TestValidLegacyMigrationScansActualRetainedArtifact)
 	t.Run("user backup", TestUserDataRecoversFromAtomicBackup)
-	t.Run("migration crashes", TestUserDataMigrationCrashPointsConverge)
 	t.Run("sensitive scan", TestRuntimeAndUserArtifactsNeverPersistSensitiveValues)
 	t.Run("probe seam", TestProbeAttemptSeamRuntimeRoundTrip)
 	t.Run("genesis wal", TestBindingGenesisAndInjectedCredentialWAL)
@@ -1742,6 +1734,6 @@ func TestSuiteRuntimeWiring(t *testing.T) {
 	t.Run("runtime corruption repair", TestStateStoreQuarantinesCorruptionAndRepairsFromBackup)
 	t.Run("atomic roster publication", TestRosterPublicationStaysFailClosedUntilAllGenesisSucceeds)
 	t.Run("runtime dual corruption", TestStateStoreDualCorruptionPreservesBothEvidenceAndFences)
-	t.Run("user schema corruption", TestUserDataSchemaMigrationAndCorruptionEvidence)
+	t.Run("user schema corruption", TestUserDataUnsupportedSchemaAndCorruptionEvidence)
 	t.Run("user future dual corruption", TestUserDataFutureSchemaFailsSafeAndDualCorruptionPreservesEvidence)
 }
