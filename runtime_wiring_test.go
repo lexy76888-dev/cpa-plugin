@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lexy76888-dev/cpa-plugin/testsupport"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
