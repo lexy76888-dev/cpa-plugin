@@ -678,7 +678,7 @@ func TestStatusHTMLRedactsSensitiveFieldsAndEscapesUserFields(t *testing.T) {
 	}
 	html := string(resp.Body)
 	lower := strings.ToLower(html)
-	if !strings.Contains(html, "codex-quota-scheduler") {
+	if !strings.Contains(html, PluginID) {
 		t.Fatalf("html missing plugin id: %s", html)
 	}
 	for _, want := range []string{"Codex 额度调度器", "调度设置", "账号队列", "保存设置", "刷新额度", "账号卡片"} {
@@ -713,7 +713,7 @@ func TestStatusHTMLUsesManagementAPIActionsModalProgressAndLogs(t *testing.T) {
 	}
 	html := string(resp.Body)
 	lower := strings.ToLower(html)
-	for _, want := range []string{"quota-bar", "editDialog", "logList", "openEdit", "exportLogs", "codex-quota-scheduler-logs.json", "maxLogEntries", "logRetention", "refreshOneQuota", "refreshStatus", "renderAccounts", "renderMetrics", "metricNextAuthID", "metricMonthlyMode", "metricLastSelected", "managementKey", "loadStatus", "MANAGEMENT_BASE", "/v0/management/plugins/cpa-quota", "authHeaders()", "localeSelect", "TRANSLATIONS", "codex-quota-scheduler-locale-v1", "Scheduler Settings", "Account Queue", "INLINE_TRANSLATIONS", "Reset credits", "Refresh Quota", `id="editSchedulerPriority"`, "account.schedulerPriority", "scheduler_priority", "Plugin priority", "插件优先级"} {
+	for _, want := range []string{"quota-bar", "editDialog", "logList", "openEdit", "exportLogs", "cpa-quota-logs.json", "maxLogEntries", "logRetention", "refreshOneQuota", "refreshStatus", "renderAccounts", "renderMetrics", "metricNextAuthID", "metricMonthlyMode", "metricLastSelected", "managementKey", "loadStatus", "MANAGEMENT_BASE", "/v0/management/plugins/cpa-quota", "authHeaders()", "localeSelect", "TRANSLATIONS", "cpa-quota-locale-v1", "Scheduler Settings", "Account Queue", "INLINE_TRANSLATIONS", "Reset credits", "Refresh Quota", `id="editSchedulerPriority"`, "account.schedulerPriority", "scheduler_priority", "Plugin priority", "插件优先级"} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("html missing marker %q: %s", want, html)
 		}
