@@ -67,6 +67,18 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return okEnvelope(map[string]bool{"stopped": true})
 	case pluginabi.MethodSchedulerPick:
 		return handleSchedulerPick(request)
+	case pluginabi.MethodRequestInterceptBefore:
+		return handleQuotaRequestStart(request)
+	case pluginabi.MethodRequestInterceptAfter:
+		return okEnvelope(pluginapi.RequestInterceptResponse{})
+	case pluginabi.MethodResponseInterceptAfter:
+		return handleQuotaResponse(request)
+	case pluginabi.MethodResponseInterceptStreamChunk:
+		return handleQuotaStream(request)
+	case pluginabi.MethodWebSocketResponseEvent:
+		return handleQuotaWebSocket(request)
+	case pluginabi.MethodRequestComplete:
+		return handleQuotaCompletion(request)
 	case pluginabi.MethodUsageHandle:
 		return handleUsageHandle(request)
 	case pluginabi.MethodManagementRegister:

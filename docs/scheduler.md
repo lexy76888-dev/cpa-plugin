@@ -251,6 +251,12 @@ access token、Authorization header、Cookie 和其他凭据字段。
 调度页面 Resource 路由只提供界面外壳，调度数据与操作走 Management 认证。
 另有独立认证的 `/snapshot` Resource API，使用专用只读令牌，不能执行管理操作。
 
+## 响应额度与冷却恢复
+
+插件接入当前 CPA 的请求生命周期、普通响应、流式响应和 WebSocket 观察回调，按请求开始时冻结的账号绑定接收额度观测。额度观测与探测验证结果回写同一调度状态；旧观测不得覆盖较新的耗尽结果。正文、请求头和凭据只在有界内存中处理，不落盘。
+
+CPAMP 提供 `/usage-service/quota-cooldowns/recover-verified` 时，插件只恢复由管理器持有且已核对原记录时间、账号绑定和新额度观测的额度冷却，不改手动禁用或其他故障状态。恢复请求结果未知时核对原记录，不盲目重复提交。连接配置使用状态目录内权限为 `0600` 的 `cpamp-recovery.json`，字段为 `url` 和 `key`；只允许 HTTPS 或数字回环 HTTP。缺配置或接口不可用时保留冷却并明确记录失败。
+
 ## Management API
 
 下面路径均以 `/v0/management/plugins/cpa-quota` 为前缀，使用 `Authorization: Bearer <CPA管理Key>`。`Content-Type: application/json` 用于带 JSON 正文的写入。Resource 页面 `/v0/resource/plugins/cpa-quota/status` 只提供外壳，不携带受保护账号数据。
