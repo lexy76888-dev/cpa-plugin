@@ -134,7 +134,6 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 	credentialHost := &rosterCredentialHost{host: ABIHostClient{}, roster: roster}
 	production, err := NewProductionQuotaRefresher(ABIHostClient{}, globalState, credentialHost, roster, defaultStatePath(), time.Now)
 	if err == nil {
-		production.waitQuota = statusService.WaitQuota
 		globalRefresher = production
 		credentialHost.bindings = production.bindings
 	} else {

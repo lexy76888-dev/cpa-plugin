@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"log"
 	"math"
 	"net/url"
 	"regexp"
@@ -194,122 +193,38 @@ func (e *engine) runtimeCooling(a rawAccount) section[[]runtimeCooldown] {
 	return result
 }
 
-func (e *engine) queryQuota(ctx context.Context, a rawAccount) (result section[*quota]) {
-	result.Stale = true
-	defer func() {
-		if ctx.Err() != nil {
-			return
-		}
-		outcome := "failed"
-		if !result.Stale && result.Data != nil && len(result.Data.Windows) > 0 {
-			outcome = "ok"
-		}
-		log.Printf("cpa_snapshot_quota_request outcome=%s", outcome)
-	}()
-	header := map[string]string{"Authorization": "Bearer $TOKEN$", "Content-Type": "application/json", "User-Agent": "codex_cli_rs/0.159.2"}
-	if a.workspace != "" {
-		header["Chatgpt-Account-Id"] = a.workspace
-	}
-	body := map[string]any{"authIndex": a.Index, "method": "GET", "url": "https://chatgpt.com/backend-api/wham/usage", "header": header}
-	var reply struct {
-		Status      int             `json:"status_code"`
-		StatusCamel int             `json:"statusCode"`
-		Body        json.RawMessage `json:"body"`
-	}
-	if code := e.client.read(ctx, "/v0/management/api-call", body, &reply); code != "" {
-		result.Error = code
+func storedAccountQuota(a rawAccount, stored map[string]StoredQuota, now int64) section[*quota] {
+	result := section[*quota]{Stale: true, Error: "quota_not_observed"}
+	v, ok := stored[a.Index]
+	if !ok || (a.ID != "" && a.ID != v.AuthID) ||
+		(a.member != "" && v.Member != "" && !strings.EqualFold(a.member, v.Member)) ||
+		v.ObservedAtMS <= 0 || v.ObservedAtMS > now {
 		return result
 	}
-	at := e.now().UnixMilli()
-	if reply.Status == 0 {
-		reply.Status = reply.StatusCamel
-	}
-	if reply.Status != 200 {
-		result.Error = "quota_http_error"
-		if reply.Status == 401 || reply.Status == 403 {
-			result.Error = "quota_auth_failed"
-		}
-		return result
-	}
-	raw := reply.Body
-	if len(raw) > 0 && raw[0] == '"' {
-		var text string
-		if json.Unmarshal(raw, &text) != nil {
-			result.Error = "quota_invalid"
+	if a.workspace != "" && a.workspace != v.Workspace {
+		// 自然回包可只保存绑定的账号摘要；此处沿用同一身份，不读取凭据。
+		if v.Workspace != "" || sha256.Sum256([]byte(a.workspace)) != v.SubjectHash {
 			return result
 		}
-		raw = []byte(text)
 	}
-	type rawWindow struct {
-		Used    *float64 `json:"used_percent"`
-		Seconds *int64   `json:"limit_window_seconds"`
-		Reset   *float64 `json:"reset_at"`
-		After   *float64 `json:"reset_after_seconds"`
-	}
-	type limits struct {
-		Allowed   *bool      `json:"allowed"`
-		Reached   *bool      `json:"limit_reached"`
-		Primary   *rawWindow `json:"primary_window"`
-		Secondary *rawWindow `json:"secondary_window"`
-	}
-	var payload struct {
-		Plan   string  `json:"plan_type"`
-		Limits *limits `json:"rate_limit"`
-		Camel  *limits `json:"rateLimit"`
-	}
-	if json.Unmarshal(raw, &payload) != nil {
-		result.Error = "quota_invalid"
-		return result
-	}
-	lim := payload.Limits
-	if lim == nil {
-		lim = payload.Camel
-	}
-	if lim == nil {
-		result.Error = "quota_invalid"
-		return result
-	}
-	q := &quota{Allowed: lim.Allowed, LimitReached: lim.Reached, Windows: []window{}, Scope: "codex_main"}
-	switch payload.Plan {
-	case "free", "go", "plus", "pro", "team", "business", "enterprise", "edu":
-		q.Plan = payload.Plan
-	}
-	for i, w := range []*rawWindow{lim.Primary, lim.Secondary} {
-		if w == nil {
+	q := &quota{Scope: "codex_main", Plan: v.Plan}
+	stale, blocked := v.Stale, v.Blocked
+	for _, w := range v.Windows {
+		if !nonnegative(w.Used) || w.Used > 100 || w.Seconds <= 0 || w.EndMS <= 0 {
 			continue
 		}
-		if w.Used == nil || *w.Used < 0 || *w.Used > 100 || w.Seconds == nil || *w.Seconds <= 0 || *w.Seconds > 366*86400 {
-			result.Error = "quota_invalid"
-			return result
-		}
-		reset := float64(0)
-		if w.Reset != nil {
-			reset = *w.Reset * 1000
-		} else if w.After != nil {
-			reset = float64(at) + *w.After*1000
-		}
-		if reset <= 0 || reset > float64(at)+366*86400000 {
-			result.Error = "quota_invalid"
-			return result
-		}
-		kind := "primary"
-		if i == 1 {
-			kind = "secondary"
-		}
-		q.Windows = append(q.Windows, window{Kind: kind, UsedPercent: *w.Used, RemainingPercent: 100 - *w.Used, DurationSeconds: *w.Seconds, ResetAtMS: int64(reset)})
+		stale = stale || w.EndMS <= now
+		blocked = blocked || w.Used >= 100
+		q.Windows = append(q.Windows, window{Kind: w.Kind, UsedPercent: w.Used, RemainingPercent: 100 - w.Used, DurationSeconds: w.Seconds, ResetAtMS: w.EndMS})
 	}
 	if len(q.Windows) == 0 {
-		result.Error = "quota_invalid"
 		return result
 	}
-	result.Data = q
-	result.ObservedAtMS = at
-	result.Stale = false
-	for _, w := range q.Windows {
-		if w.ResetAtMS <= e.now().UnixMilli() {
-			result.Stale = true
-			result.Error = "quota_expired"
-		}
+	allowed := !blocked
+	q.Allowed, q.LimitReached = &allowed, &blocked
+	result = section[*quota]{Data: q, ObservedAtMS: v.ObservedAtMS, Stale: stale}
+	if stale {
+		result.Error = "quota_stale"
 	}
 	return result
 }
@@ -328,54 +243,10 @@ func (e *engine) cooling(ctx context.Context) section[[]rawCooldown] {
 	return section[[]rawCooldown]{ObservedAtMS: e.now().UnixMilli(), Data: *reply.Items}
 }
 
-// 慢账号在后台继续；本轮只等共同的短暂收集窗口，迟到结果由下一次快照领取。
-func (e *engine) accountQuota(ctx context.Context, a rawAccount, force bool) (section[*quota], bool) {
-	e.quotaMu.Lock()
-	job := e.quotaReads[a.identity]
-	if job != nil {
-		select {
-		case <-job.done:
-			if job.binding != a.binding || (job.used && (force || time.Since(job.started) >= time.Minute)) || (force && job.value.Error != "") {
-				job = nil
-			}
-		default:
-		}
-	}
-	if job == nil {
-		job = &accountQuotaRead{binding: a.binding, started: time.Now(), done: make(chan struct{})}
-		e.quotaReads[a.identity] = job
-		e.quotaWorkers.Add(1)
-		go func(j *accountQuotaRead) {
-			defer e.quotaWorkers.Done()
-			j.value = e.queryQuota(e.lifecycle, a)
-			close(j.done)
-		}(job)
-	}
-	e.quotaMu.Unlock()
-	select {
-	case <-job.done:
-	case <-ctx.Done():
-		select {
-		case <-job.done:
-		default:
-			return section[*quota]{Stale: true, Error: "quota_pending"}, false
-		}
-	}
-	e.quotaMu.Lock()
-	defer e.quotaMu.Unlock()
-	if job.binding != a.binding {
-		return section[*quota]{Stale: true, Error: "identity_unconfirmed"}, false
-	}
-	reused := job.used
-	job.used = true
-	return job.value, reused
-}
-
-func (e *engine) collect(previous *snapshot, force bool) *snapshot {
+func (e *engine) collect() *snapshot {
 	ctx, cancel := context.WithCancel(e.lifecycle)
 	defer cancel()
-	// 管理端辅助字段有独立预算，身份名单及最终核对仍须取得真实响应。
-	work, stop := context.WithTimeout(ctx, 8*time.Second)
+	work, stop := context.WithCancel(ctx)
 	defer stop()
 	result := &snapshot{SchemaVersion: 2, ClientScope: e.opaque("client", e.clientHash), StartedAtMS: e.now().UnixMilli(), RefreshAfterSeconds: 60}
 	var files []rawAccount
@@ -386,21 +257,16 @@ func (e *engine) collect(previous *snapshot, force bool) *snapshot {
 	go func() { defer wg.Done(); cool = e.cooling(work) }()
 	go func() { defer wg.Done(); result.Recent = e.recent(work) }()
 	go func() { defer wg.Done(); result.Prices = e.prices(work) }()
-	files, code = e.accounts(ctx)
+	files, code = e.accounts(work)
 	result.Accounts = section[[]account]{ObservedAtMS: e.now().UnixMilli(), Stale: code != "", Error: code, Data: []account{}}
 	if code != "" {
 		result.Accounts.ObservedAtMS = 0
 	}
-	old := map[string]account{}
-	if previous != nil {
-		for _, a := range previous.Accounts.Data {
-			old[a.ID] = a
-		}
+	var stored map[string]StoredQuota
+	if code == "" && e.storedQuota != nil {
+		stored = e.storedQuota()
 	}
 	if code == "" {
-		// 名单已经取得，额度任务独立于 HTTP 快照生命周期。
-		quotaWindow, finishQuotaWindow := context.WithTimeout(ctx, 2*time.Second)
-		defer finishQuotaWindow()
 		rows := make([]account, len(files))
 		jobs := make(chan int)
 		var workers sync.WaitGroup
@@ -424,15 +290,8 @@ func (e *engine) collect(previous *snapshot, force bool) *snapshot {
 						row.Status = a.Status
 					}
 					row.Routing = e.runtimeCooling(a)
-					row.Quota, row.quotaReused = e.accountQuota(quotaWindow, a, force)
+					row.Quota = storedAccountQuota(a, stored, e.now().UnixMilli())
 					row.Models = e.models(work, a, row.ObservedAtMS)
-					if prior, ok := old[a.identity]; ok && prior.binding == a.binding && row.quotaReused && prior.Quota.ObservedAtMS == row.Quota.ObservedAtMS {
-						row.quotaSynced = prior.quotaSynced
-					}
-					if prior, ok := old[a.identity]; ok && prior.binding == a.binding && row.Quota.Error != "" && row.Quota.Data == nil {
-						row.Quota.Data = prior.Quota.Data
-						row.Quota.ObservedAtMS = prior.Quota.ObservedAtMS
-					}
 					rows[i] = row
 				}
 			}()
@@ -466,11 +325,9 @@ func (e *engine) collect(previous *snapshot, force bool) *snapshot {
 				result.Accounts.Stale = true
 			}
 		}
-		// 只在身份复核后保存本次成功观测，再从同一 CPAMP 生命周期读取金额。
-		enrichment, finishEnrichment := context.WithTimeout(ctx, 4*time.Second)
-		e.syncQuotaObservations(enrichment, files, rows)
-		e.cycleEstimates(enrichment, files, rows, result.Prices)
-		finishEnrichment()
+		// 身份复核后批量读取 CPAMP 已有周期、额度和金额。
+
+		e.cycleEstimates(ctx, files, rows, result.Prices)
 		e.saveReferences(files)
 		result.Accounts.Data = rows
 	}
@@ -515,17 +372,6 @@ func (e *engine) collect(previous *snapshot, force bool) *snapshot {
 	for _, a := range files {
 		active[a.identity] = true
 	}
-	e.quotaMu.Lock()
-	for key, job := range e.quotaReads {
-		if !active[key] && time.Since(job.started) >= time.Minute {
-			select {
-			case <-job.done:
-				delete(e.quotaReads, key)
-			default:
-			}
-		}
-	}
-	e.quotaMu.Unlock()
 	for key := range e.modelsCache {
 		if !active[key] {
 			delete(e.modelsCache, key)

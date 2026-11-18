@@ -59,7 +59,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		if err := configure(request); err != nil {
 			return nil, err
 		}
-		statusService.Reconfigure()
+		statusService.Reconfigure(globalState.storedQuota)
 		startGlobalRefresher()
 		return okEnvelope(PluginRegistration())
 	case "plugin.quiesce", "plugin.shutdown":
@@ -284,6 +284,49 @@ func handleUsageHandle(raw []byte) ([]byte, error) {
 		publishSchedulerState(globalState, snapshot.ActiveHighestTier, now)
 	}
 	return okEnvelope(map[string]any{})
+}
+
+// 快照端口只复制展示额度；页面读取不唤醒调度器，不触碰凭据或上游。
+func (s *PluginState) storedQuota() map[string]status.StoredQuota {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows := make(map[string]status.StoredQuota, len(s.accounts))
+	for _, a := range s.accounts {
+		if a.AuthIndex == "" || a.LastSuccessAt.IsZero() || !s.admissionCurrentLocked(a.AuthID, s.cpaAdmissionVersion) {
+			continue
+		}
+		observed := a.QuotaObservedAt
+		if observed.IsZero() || observed.After(a.LastSuccessAt) {
+			observed = a.LastSuccessAt
+		}
+		v := status.StoredQuota{AuthID: a.AuthID, Workspace: a.ChatGPTAccountID, SubjectHash: a.CredentialFingerprint.SubjectHash, Member: a.Email, Plan: a.Quota.PlanType, ObservedAtMS: observed.UnixMilli(),
+			Stale: time.Since(observed) > s.cfg.StaleAfter || a.Refresh.AuthFailure || a.LastError != "", Blocked: a.TemporaryExhausted || a.Quota.UsageLimitReached}
+		for _, w := range []*QuotaWindow{a.Quota.FiveHour, a.Quota.LongWindow} {
+			if w == nil || w.UsedPercent == nil || w.ResetAt.IsZero() {
+				continue
+			}
+			seconds := int64(0)
+			if w.LimitWindowSeconds != nil {
+				seconds = *w.LimitWindowSeconds
+			} else if w.Kind == WindowFiveHour {
+				seconds = 18000
+			} else if w.Kind == WindowWeekly {
+				seconds = 604800
+			}
+			kind := "secondary"
+			if w.Kind == WindowFiveHour {
+				kind = "primary"
+			}
+			v.Windows = append(v.Windows, status.StoredWindow{Kind: kind, Used: *w.UsedPercent, Seconds: seconds, EndMS: w.ResetAt.UnixMilli()})
+			v.Blocked = v.Blocked || w.Exhausted
+		}
+		if _, duplicate := rows[a.AuthIndex]; duplicate {
+			rows[a.AuthIndex] = status.StoredQuota{}
+			continue
+		}
+		rows[a.AuthIndex] = v
+	}
+	return rows
 }
 
 func handleManagementHandle(raw []byte) ([]byte, error) {

@@ -1758,11 +1758,6 @@ func (r *QuotaRefresher) typedFetchQuota(ctx context.Context, held *HeldLease, c
 	}
 	var resp pluginapi.HTTPResponse
 	err := held.DoHTTP(ctx, func(context.Context) error {
-		if wait := r.lifecycleRefresher().waitQuota; wait != nil {
-			if err := wait(ctx, credentials.ChatGPTAccountID); err != nil {
-				return err
-			}
-		}
 		var err error
 		resp, err = r.doBackgroundHTTPRequest(pluginapi.HTTPRequest{Method: http.MethodGet, URL: r.state.Config().QuotaEndpoint, Headers: http.Header{
 			"Authorization": []string{"Bearer " + credentials.AccessToken}, "Chatgpt-Account-Id": []string{credentials.ChatGPTAccountID}, "Content-Type": []string{"application/json"}, "User-Agent": []string{quotaUserAgent},
