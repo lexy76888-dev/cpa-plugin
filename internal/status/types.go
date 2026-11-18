@@ -41,6 +41,7 @@ type account struct {
 	Quota        section[*quota]            `json:"quota"`
 	binding      string
 	quotaSynced  bool
+	quotaReused  bool
 }
 type cooldown struct {
 	AccountID   string `json:"account_id"`

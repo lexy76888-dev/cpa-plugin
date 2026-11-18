@@ -29,7 +29,18 @@ type flight struct {
 	done  chan struct{}
 	value *snapshot
 }
+type accountQuotaRead struct {
+	binding string
+	started time.Time
+	done    chan struct{}
+	value   section[*quota]
+	used    bool
+}
+
 type engine struct {
+	quotaMu                       sync.Mutex
+	quotaReads                    map[string]*accountQuotaRead
+	quotaWorkers                  sync.WaitGroup
 	client                        *managerClient
 	clientHash                    string
 	token                         [32]byte
@@ -49,7 +60,7 @@ type engine struct {
 }
 
 func newEngine(c config, key string, token []byte) *engine {
-	e := &engine{client: newClient(c.ManagerURL, key), clientHash: c.ClientKeySHA256, token: sha256.Sum256(token), now: time.Now, modelsCache: map[string]modelCache{}, syncQuota: c.SyncQuotaSnapshots,
+	e := &engine{client: newClient(c.ManagerURL, key), clientHash: c.ClientKeySHA256, token: sha256.Sum256(token), now: time.Now, modelsCache: map[string]modelCache{}, quotaReads: make(map[string]*accountQuotaRead), syncQuota: c.SyncQuotaSnapshots,
 		references: map[string]estimateReference{}, referencePath: c.EstimateStateFile}
 	e.referenceScope = e.opaque("estimate-scope", c.ManagerURL, key, c.ClientKeySHA256)
 	e.lifecycle, e.stop = context.WithCancel(context.Background())
@@ -66,7 +77,9 @@ func (e *engine) close() {
 	if running != nil {
 		<-running.done
 	}
+	e.quotaWorkers.Wait()
 	e.client.http.CloseIdleConnections()
+	e.client.quotaHTTP.CloseIdleConnections()
 }
 
 func response(status int, value any) managementResponse {
@@ -183,7 +196,7 @@ func (e *engine) get(force bool) (*snapshot, bool) {
 				result = &snapshot{SchemaVersion: 2, ClientScope: e.opaque("client", e.clientHash), GeneratedAtMS: e.now().UnixMilli(), RefreshAfterSeconds: 60, Accounts: section[[]account]{Stale: true, Error: "collection_failed"}, Cooldowns: section[[]cooldown]{Stale: true, Error: "collection_failed"}, Recent: section[*recent]{Stale: true, Error: "collection_failed"}, Prices: section[map[string]map[string]any]{Stale: true, Error: "collection_failed"}}
 			}
 		}()
-		return e.collect(previous)
+		return e.collect(previous, force)
 	}()
 	e.mu.Lock()
 	e.last = value

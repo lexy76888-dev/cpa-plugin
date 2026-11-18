@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"log"
 	"math"
 	"net/url"
 	"regexp"
@@ -193,9 +194,18 @@ func (e *engine) runtimeCooling(a rawAccount) section[[]runtimeCooldown] {
 	return result
 }
 
-func (e *engine) queryQuota(ctx context.Context, a rawAccount) section[*quota] {
-	at := e.now().UnixMilli()
-	result := section[*quota]{Stale: true}
+func (e *engine) queryQuota(ctx context.Context, a rawAccount) (result section[*quota]) {
+	result.Stale = true
+	defer func() {
+		if ctx.Err() != nil {
+			return
+		}
+		outcome := "failed"
+		if !result.Stale && result.Data != nil && len(result.Data.Windows) > 0 {
+			outcome = "ok"
+		}
+		log.Printf("cpa_snapshot_quota_request outcome=%s", outcome)
+	}()
 	header := map[string]string{"Authorization": "Bearer $TOKEN$", "Content-Type": "application/json", "User-Agent": "codex_cli_rs/0.159.2"}
 	if a.workspace != "" {
 		header["Chatgpt-Account-Id"] = a.workspace
@@ -210,6 +220,7 @@ func (e *engine) queryQuota(ctx context.Context, a rawAccount) section[*quota] {
 		result.Error = code
 		return result
 	}
+	at := e.now().UnixMilli()
 	if reply.Status == 0 {
 		reply.Status = reply.StatusCamel
 	}
@@ -317,10 +328,54 @@ func (e *engine) cooling(ctx context.Context) section[[]rawCooldown] {
 	return section[[]rawCooldown]{ObservedAtMS: e.now().UnixMilli(), Data: *reply.Items}
 }
 
-func (e *engine) collect(previous *snapshot) *snapshot {
+// 慢账号在后台继续；本轮只等共同的短暂收集窗口，迟到结果由下一次快照领取。
+func (e *engine) accountQuota(ctx context.Context, a rawAccount, force bool) (section[*quota], bool) {
+	e.quotaMu.Lock()
+	job := e.quotaReads[a.identity]
+	if job != nil {
+		select {
+		case <-job.done:
+			if job.binding != a.binding || (job.used && (force || time.Since(job.started) >= time.Minute)) || (force && job.value.Error != "") {
+				job = nil
+			}
+		default:
+		}
+	}
+	if job == nil {
+		job = &accountQuotaRead{binding: a.binding, started: time.Now(), done: make(chan struct{})}
+		e.quotaReads[a.identity] = job
+		e.quotaWorkers.Add(1)
+		go func(j *accountQuotaRead) {
+			defer e.quotaWorkers.Done()
+			j.value = e.queryQuota(e.lifecycle, a)
+			close(j.done)
+		}(job)
+	}
+	e.quotaMu.Unlock()
+	select {
+	case <-job.done:
+	case <-ctx.Done():
+		select {
+		case <-job.done:
+		default:
+			return section[*quota]{Stale: true, Error: "quota_pending"}, false
+		}
+	}
+	e.quotaMu.Lock()
+	defer e.quotaMu.Unlock()
+	if job.binding != a.binding {
+		return section[*quota]{Stale: true, Error: "identity_unconfirmed"}, false
+	}
+	reused := job.used
+	job.used = true
+	return job.value, reused
+}
+
+func (e *engine) collect(previous *snapshot, force bool) *snapshot {
 	ctx, cancel := context.WithCancel(e.lifecycle)
 	defer cancel()
-	work, stop := context.WithCancel(ctx)
+	// 管理端辅助字段有独立预算，身份名单及最终核对仍须取得真实响应。
+	work, stop := context.WithTimeout(ctx, 8*time.Second)
 	defer stop()
 	result := &snapshot{SchemaVersion: 2, ClientScope: e.opaque("client", e.clientHash), StartedAtMS: e.now().UnixMilli(), RefreshAfterSeconds: 60}
 	var files []rawAccount
@@ -331,7 +386,7 @@ func (e *engine) collect(previous *snapshot) *snapshot {
 	go func() { defer wg.Done(); cool = e.cooling(work) }()
 	go func() { defer wg.Done(); result.Recent = e.recent(work) }()
 	go func() { defer wg.Done(); result.Prices = e.prices(work) }()
-	files, code = e.accounts(work)
+	files, code = e.accounts(ctx)
 	result.Accounts = section[[]account]{ObservedAtMS: e.now().UnixMilli(), Stale: code != "", Error: code, Data: []account{}}
 	if code != "" {
 		result.Accounts.ObservedAtMS = 0
@@ -343,6 +398,9 @@ func (e *engine) collect(previous *snapshot) *snapshot {
 		}
 	}
 	if code == "" {
+		// 名单已经取得，额度任务独立于 HTTP 快照生命周期。
+		quotaWindow, finishQuotaWindow := context.WithTimeout(ctx, 2*time.Second)
+		defer finishQuotaWindow()
 		rows := make([]account, len(files))
 		jobs := make(chan int)
 		var workers sync.WaitGroup
@@ -366,8 +424,11 @@ func (e *engine) collect(previous *snapshot) *snapshot {
 						row.Status = a.Status
 					}
 					row.Routing = e.runtimeCooling(a)
-					row.Quota = e.queryQuota(work, a)
+					row.Quota, row.quotaReused = e.accountQuota(quotaWindow, a, force)
 					row.Models = e.models(work, a, row.ObservedAtMS)
+					if prior, ok := old[a.identity]; ok && prior.binding == a.binding && row.quotaReused && prior.Quota.ObservedAtMS == row.Quota.ObservedAtMS {
+						row.quotaSynced = prior.quotaSynced
+					}
 					if prior, ok := old[a.identity]; ok && prior.binding == a.binding && row.Quota.Error != "" && row.Quota.Data == nil {
 						row.Quota.Data = prior.Quota.Data
 						row.Quota.ObservedAtMS = prior.Quota.ObservedAtMS
@@ -406,8 +467,10 @@ func (e *engine) collect(previous *snapshot) *snapshot {
 			}
 		}
 		// 只在身份复核后保存本次成功观测，再从同一 CPAMP 生命周期读取金额。
-		e.syncQuotaObservations(ctx, files, rows)
-		e.cycleEstimates(ctx, files, rows, result.Prices)
+		enrichment, finishEnrichment := context.WithTimeout(ctx, 4*time.Second)
+		e.syncQuotaObservations(enrichment, files, rows)
+		e.cycleEstimates(enrichment, files, rows, result.Prices)
+		finishEnrichment()
 		e.saveReferences(files)
 		result.Accounts.Data = rows
 	}
@@ -452,6 +515,17 @@ func (e *engine) collect(previous *snapshot) *snapshot {
 	for _, a := range files {
 		active[a.identity] = true
 	}
+	e.quotaMu.Lock()
+	for key, job := range e.quotaReads {
+		if !active[key] && time.Since(job.started) >= time.Minute {
+			select {
+			case <-job.done:
+				delete(e.quotaReads, key)
+			default:
+			}
+		}
+	}
+	e.quotaMu.Unlock()
 	for key := range e.modelsCache {
 		if !active[key] {
 			delete(e.modelsCache, key)

@@ -53,7 +53,7 @@ func (e *engine) syncQuotaObservations(parent context.Context, files []rawAccoun
 			indices := map[string]int{}
 			for i := start; i < end; i++ {
 				q := rows[i].Quota
-				if q.Data == nil || q.Stale || q.Error != "" || q.Data.Scope != "codex_main" || q.ObservedAtMS <= 0 {
+				if rows[i].quotaReused || q.Data == nil || q.Stale || q.Error != "" || q.Data.Scope != "codex_main" || q.ObservedAtMS <= 0 {
 					continue
 				}
 				entry := quotaWrite{RowKey: rows[i].ID, Provider: "codex", Account: credentialTarget(files[i])}

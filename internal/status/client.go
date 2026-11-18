@@ -18,17 +18,24 @@ import (
 type managerClient struct {
 	origin, key string
 	http        *http.Client
+	quotaHTTP   *http.Client
 	slots       chan struct{}
+	quotaSlots  chan struct{}
+	waitQuota   func(context.Context, string) error
 }
 
 func newClient(origin, key string) *managerClient {
-	return &managerClient{origin: origin, key: key, slots: make(chan struct{}, 6), http: &http.Client{
-		CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirect_refused") },
-		Transport: &http.Transport{Proxy: nil, DialContext: (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
-			TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}, TLSHandshakeTimeout: 3 * time.Second,
-			MaxConnsPerHost: 6, MaxIdleConnsPerHost: 6, IdleConnTimeout: 90 * time.Second,
-			ResponseHeaderTimeout: 6 * time.Second},
-	}}
+	transport := &http.Transport{Proxy: nil, DialContext: (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
+		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}, TLSHandshakeTimeout: 3 * time.Second,
+		MaxConnsPerHost: 6, MaxIdleConnsPerHost: 6, IdleConnTimeout: 90 * time.Second,
+		ResponseHeaderTimeout: 6 * time.Second}
+	// 上游额度可能比管理元数据慢；单独的连接池允许它继续完成。
+	quotaTransport := transport.Clone()
+	quotaTransport.ResponseHeaderTimeout = 30 * time.Second
+	noRedirect := func(*http.Request, []*http.Request) error { return errors.New("redirect_refused") }
+	return &managerClient{origin: origin, key: key, slots: make(chan struct{}, 6), quotaSlots: make(chan struct{}, 6),
+		http:      &http.Client{Transport: transport, CheckRedirect: noRedirect},
+		quotaHTTP: &http.Client{Transport: quotaTransport, CheckRedirect: noRedirect}}
 }
 
 // 每次阻塞读取保留原八秒空闲容限，持续到达的数据不受总耗时限制。
@@ -66,9 +73,13 @@ func (c *managerClient) saveQuota(ctx context.Context, entries []quotaWrite, tar
 }
 
 func (c *managerClient) request(ctx context.Context, path string, body any, target any) string {
+	slots := c.slots
+	if path == "/v0/management/api-call" {
+		slots = c.quotaSlots
+	}
 	select {
-	case c.slots <- struct{}{}:
-		defer func() { <-c.slots }()
+	case slots <- struct{}{}:
+		defer func() { <-slots }()
 	case <-ctx.Done():
 		return "timeout"
 	}
@@ -89,7 +100,21 @@ func (c *managerClient) request(ctx context.Context, path string, body any, targ
 	req.Header.Set("Authorization", "Bearer "+c.key)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.http.Do(req)
+	if path == "/v0/management/api-call" && c.waitQuota != nil {
+		query := body.(map[string]any)
+		account := query["header"].(map[string]string)["Chatgpt-Account-Id"]
+		if account == "" {
+			account = query["authIndex"].(string)
+		}
+		if c.waitQuota(ctx, account) != nil {
+			return "timeout"
+		}
+	}
+	client := c.http
+	if path == "/v0/management/api-call" {
+		client = c.quotaHTTP
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
 			return "timeout"

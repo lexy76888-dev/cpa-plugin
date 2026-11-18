@@ -208,6 +208,7 @@ type HostClient interface {
 type ABIHostClient struct{}
 
 type QuotaRefresher struct {
+	waitQuota         func(context.Context, string) error
 	host              HostClient
 	state             *PluginState
 	now               func() time.Time
@@ -1983,6 +1984,19 @@ func (r *QuotaRefresher) fetchQuota(credentials CodexCredentials, authID string,
 			"Content-Type":       []string{"application/json"},
 			"User-Agent":         []string{quotaUserAgent},
 		},
+	}
+	if wait := r.lifecycleRefresher().waitQuota; wait != nil {
+		ctx := r.txnContext
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		account := credentials.ChatGPTAccountID
+		if account == "" {
+			account = authID
+		}
+		if err := wait(ctx, account); err != nil {
+			return ParsedQuota{}, err
+		}
 	}
 	resp, err := r.doWithAdmissionPermit(authID, version, req)
 	if err != nil {
