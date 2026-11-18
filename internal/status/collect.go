@@ -193,112 +193,38 @@ func (e *engine) runtimeCooling(a rawAccount) section[[]runtimeCooldown] {
 	return result
 }
 
-func (e *engine) queryQuota(ctx context.Context, a rawAccount) section[*quota] {
-	at := e.now().UnixMilli()
-	result := section[*quota]{Stale: true}
-	header := map[string]string{"Authorization": "Bearer $TOKEN$", "Content-Type": "application/json", "User-Agent": "codex_cli_rs/0.159.2"}
-	if a.workspace != "" {
-		header["Chatgpt-Account-Id"] = a.workspace
-	}
-	body := map[string]any{"authIndex": a.Index, "method": "GET", "url": "https://chatgpt.com/backend-api/wham/usage", "header": header}
-	var reply struct {
-		Status      int             `json:"status_code"`
-		StatusCamel int             `json:"statusCode"`
-		Body        json.RawMessage `json:"body"`
-	}
-	if code := e.client.read(ctx, "/v0/management/api-call", body, &reply); code != "" {
-		result.Error = code
+func storedAccountQuota(a rawAccount, stored map[string]StoredQuota, now int64) section[*quota] {
+	result := section[*quota]{Stale: true, Error: "quota_not_observed"}
+	v, ok := stored[a.Index]
+	if !ok || (a.ID != "" && a.ID != v.AuthID) ||
+		(a.member != "" && v.Member != "" && !strings.EqualFold(a.member, v.Member)) ||
+		v.ObservedAtMS <= 0 || v.ObservedAtMS > now {
 		return result
 	}
-	if reply.Status == 0 {
-		reply.Status = reply.StatusCamel
-	}
-	if reply.Status != 200 {
-		result.Error = "quota_http_error"
-		if reply.Status == 401 || reply.Status == 403 {
-			result.Error = "quota_auth_failed"
-		}
-		return result
-	}
-	raw := reply.Body
-	if len(raw) > 0 && raw[0] == '"' {
-		var text string
-		if json.Unmarshal(raw, &text) != nil {
-			result.Error = "quota_invalid"
+	if a.workspace != "" && a.workspace != v.Workspace {
+		// 自然回包可只保存绑定的账号摘要；此处沿用同一身份，不读取凭据。
+		if v.Workspace != "" || sha256.Sum256([]byte(a.workspace)) != v.SubjectHash {
 			return result
 		}
-		raw = []byte(text)
 	}
-	type rawWindow struct {
-		Used    *float64 `json:"used_percent"`
-		Seconds *int64   `json:"limit_window_seconds"`
-		Reset   *float64 `json:"reset_at"`
-		After   *float64 `json:"reset_after_seconds"`
-	}
-	type limits struct {
-		Allowed   *bool      `json:"allowed"`
-		Reached   *bool      `json:"limit_reached"`
-		Primary   *rawWindow `json:"primary_window"`
-		Secondary *rawWindow `json:"secondary_window"`
-	}
-	var payload struct {
-		Plan   string  `json:"plan_type"`
-		Limits *limits `json:"rate_limit"`
-		Camel  *limits `json:"rateLimit"`
-	}
-	if json.Unmarshal(raw, &payload) != nil {
-		result.Error = "quota_invalid"
-		return result
-	}
-	lim := payload.Limits
-	if lim == nil {
-		lim = payload.Camel
-	}
-	if lim == nil {
-		result.Error = "quota_invalid"
-		return result
-	}
-	q := &quota{Allowed: lim.Allowed, LimitReached: lim.Reached, Windows: []window{}, Scope: "codex_main"}
-	switch payload.Plan {
-	case "free", "go", "plus", "pro", "team", "business", "enterprise", "edu":
-		q.Plan = payload.Plan
-	}
-	for i, w := range []*rawWindow{lim.Primary, lim.Secondary} {
-		if w == nil {
+	q := &quota{Scope: "codex_main", Plan: v.Plan}
+	stale, blocked := v.Stale, v.Blocked
+	for _, w := range v.Windows {
+		if !nonnegative(w.Used) || w.Used > 100 || w.Seconds <= 0 || w.EndMS <= 0 {
 			continue
 		}
-		if w.Used == nil || *w.Used < 0 || *w.Used > 100 || w.Seconds == nil || *w.Seconds <= 0 || *w.Seconds > 366*86400 {
-			result.Error = "quota_invalid"
-			return result
-		}
-		reset := float64(0)
-		if w.Reset != nil {
-			reset = *w.Reset * 1000
-		} else if w.After != nil {
-			reset = float64(at) + *w.After*1000
-		}
-		if reset <= 0 || reset > float64(at)+366*86400000 {
-			result.Error = "quota_invalid"
-			return result
-		}
-		kind := "primary"
-		if i == 1 {
-			kind = "secondary"
-		}
-		q.Windows = append(q.Windows, window{Kind: kind, UsedPercent: *w.Used, RemainingPercent: 100 - *w.Used, DurationSeconds: *w.Seconds, ResetAtMS: int64(reset)})
+		stale = stale || w.EndMS <= now
+		blocked = blocked || w.Used >= 100
+		q.Windows = append(q.Windows, window{Kind: w.Kind, UsedPercent: w.Used, RemainingPercent: 100 - w.Used, DurationSeconds: w.Seconds, ResetAtMS: w.EndMS})
 	}
 	if len(q.Windows) == 0 {
-		result.Error = "quota_invalid"
 		return result
 	}
-	result.Data = q
-	result.ObservedAtMS = at
-	result.Stale = false
-	for _, w := range q.Windows {
-		if w.ResetAtMS <= e.now().UnixMilli() {
-			result.Stale = true
-			result.Error = "quota_expired"
-		}
+	allowed := !blocked
+	q.Allowed, q.LimitReached = &allowed, &blocked
+	result = section[*quota]{Data: q, ObservedAtMS: v.ObservedAtMS, Stale: stale}
+	if stale {
+		result.Error = "quota_stale"
 	}
 	return result
 }
@@ -317,7 +243,7 @@ func (e *engine) cooling(ctx context.Context) section[[]rawCooldown] {
 	return section[[]rawCooldown]{ObservedAtMS: e.now().UnixMilli(), Data: *reply.Items}
 }
 
-func (e *engine) collect(previous *snapshot) *snapshot {
+func (e *engine) collect() *snapshot {
 	ctx, cancel := context.WithCancel(e.lifecycle)
 	defer cancel()
 	work, stop := context.WithCancel(ctx)
@@ -336,11 +262,9 @@ func (e *engine) collect(previous *snapshot) *snapshot {
 	if code != "" {
 		result.Accounts.ObservedAtMS = 0
 	}
-	old := map[string]account{}
-	if previous != nil {
-		for _, a := range previous.Accounts.Data {
-			old[a.ID] = a
-		}
+	var stored map[string]StoredQuota
+	if code == "" && e.storedQuota != nil {
+		stored = e.storedQuota()
 	}
 	if code == "" {
 		rows := make([]account, len(files))
@@ -366,12 +290,8 @@ func (e *engine) collect(previous *snapshot) *snapshot {
 						row.Status = a.Status
 					}
 					row.Routing = e.runtimeCooling(a)
-					row.Quota = e.queryQuota(work, a)
+					row.Quota = storedAccountQuota(a, stored, e.now().UnixMilli())
 					row.Models = e.models(work, a, row.ObservedAtMS)
-					if prior, ok := old[a.identity]; ok && prior.binding == a.binding && row.Quota.Error != "" && row.Quota.Data == nil {
-						row.Quota.Data = prior.Quota.Data
-						row.Quota.ObservedAtMS = prior.Quota.ObservedAtMS
-					}
 					rows[i] = row
 				}
 			}()
@@ -405,8 +325,8 @@ func (e *engine) collect(previous *snapshot) *snapshot {
 				result.Accounts.Stale = true
 			}
 		}
-		// 只在身份复核后保存本次成功观测，再从同一 CPAMP 生命周期读取金额。
-		e.syncQuotaObservations(ctx, files, rows)
+		// 身份复核后批量读取 CPAMP 已有周期、额度和金额。
+
 		e.cycleEstimates(ctx, files, rows, result.Prices)
 		e.saveReferences(files)
 		result.Accounts.Data = rows

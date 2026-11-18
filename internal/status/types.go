@@ -40,7 +40,6 @@ type account struct {
 	Models       section[[]string]          `json:"models"`
 	Quota        section[*quota]            `json:"quota"`
 	binding      string
-	quotaSynced  bool
 }
 type cooldown struct {
 	AccountID   string `json:"account_id"`
@@ -118,4 +117,18 @@ type rawCooldown struct {
 type modelCache struct {
 	Binding string
 	Value   section[[]string]
+}
+
+// StoredQuota 是调度器已完成的单账号观测，保留上游时间及归属。
+type StoredQuota struct {
+	AuthID, Workspace, Member, Plan string
+	SubjectHash                     [32]byte
+	ObservedAtMS                    int64
+	Stale, Blocked                  bool
+	Windows                         []StoredWindow
+}
+type StoredWindow struct {
+	Kind           string
+	Used           float64
+	Seconds, EndMS int64
 }

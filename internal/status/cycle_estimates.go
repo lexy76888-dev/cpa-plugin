@@ -79,6 +79,20 @@ type estimateTarget struct {
 	previous    map[string]any
 }
 
+func quotaWindowID(w window) string {
+	switch w.DurationSeconds {
+	case 18000:
+		return "five-hour"
+	case 604800:
+		return "weekly"
+	default:
+		if w.DurationSeconds >= 2419200 {
+			return "monthly"
+		}
+		return ""
+	}
+}
+
 func unavailableEstimate(observed int64) *cycleEstimate {
 	return &cycleEstimate{Status: "unavailable", PriceBasis: "cpamp_price_book", Coverage: "cpamp_window", PricingCoverage: "unknown", ObservedAt: float64(observed) / 1000, Source: "cpamp"}
 }
@@ -184,8 +198,7 @@ func (e *engine) estimateBatch(ctx context.Context, files []rawAccount, rows []a
 	accounts := []map[string]any{}
 	indices := map[string]int{}
 	for i := start; i < end; i++ {
-		q := rows[i].Quota
-		if q.Data == nil || q.Stale || q.Error != "" || q.Data.Scope != "codex_main" || q.ObservedAtMS <= 0 || (e.syncQuota && !rows[i].quotaSynced) {
+		if rows[i].Quota.Error == "identity_unconfirmed" {
 			continue
 		}
 		accounts = append(accounts, map[string]any{"row_key": rows[i].ID, "provider": "codex", "account": credentialTarget(files[i])})
@@ -219,7 +232,15 @@ func (e *engine) estimateBatch(ctx context.Context, files []rawAccount, rows []a
 		if !ok || counts[item.RowKey] != 1 || item.Provider != "codex" {
 			continue
 		}
+		cached := managerCachedQuota(item.Windows, e.now().UnixMilli())
+		current := rows[i].Quota
+		if current.Data == nil || (cached.Data != nil && !cached.Stale && cached.ObservedAtMS > current.ObservedAtMS) {
+			rows[i].Quota = cached
+		}
 		q := rows[i].Quota
+		if q.Data == nil || q.Stale {
+			continue
+		}
 		for j, w := range q.Data.Windows {
 			duplicateWindow := false
 			for k, other := range q.Data.Windows {
@@ -256,7 +277,7 @@ func (e *engine) estimateBatch(ctx context.Context, files []rawAccount, rows []a
 			estimateQuota.Data = &estimateData
 			if !currentCycleAvailable(*matched, progressAt, e.now().UnixMilli()) || matched.Current.ActualStartMS >= progressAt {
 				// 满额临时边界仍由 CPAMP 保留；只延续历史总量，绝不套旧起点计算本期费用。
-				if rows[i].quotaSynced && matched.Current != nil && e.previousReferenceAllowed(files[i], estimateQuota, estimateWindow, *matched, prices) {
+				if e.syncQuota && matched.Current != nil && e.previousReferenceAllowed(files[i], estimateQuota, estimateWindow, *matched, prices) {
 					e.historicalEstimate(files[i], estimateQuota, &estimateWindow, *matched, prices)
 					q.Data.Windows[j].CycleEstimate = estimateWindow.CycleEstimate
 				}
@@ -398,4 +419,60 @@ func validWindowUsage(item windowUsage, target map[string]any) bool {
 		return item.SyncStatus == "ready" && item.LastSeenMS != nil && *item.LastSeenMS >= item.FromMS && *item.LastSeenMS < item.ToMS
 	}
 	return item.SyncStatus == "empty" && *item.Requests == 0 && *item.Tokens == 0 && *item.Cost == 0 && item.LastSeenMS == nil
+}
+
+// 调度器尚无该账号观测时，从同一次 CPAMP 周期查询读取已有额度。
+func managerCachedQuota(defs []managerWindow, now int64) section[*quota] {
+	result := section[*quota]{Stale: true, Error: "quota_not_observed"}
+	q := &quota{Scope: "codex_main"}
+	kinds := map[string]bool{}
+	blocked := false
+	for _, def := range defs {
+		if def.Availability == "inactive" || len(def.Models) > 0 {
+			continue
+		}
+		legacy := def.ScopeKind == "all" && (def.ID == "primary" || def.ID == "secondary" || def.ID == "five-hour" || def.ID == "weekly" || def.ID == "monthly")
+		if !legacy && (def.ScopeKind != "family" || def.ScopeKey != "codex_main") {
+			continue
+		}
+		if def.DurationSeconds == nil || *def.DurationSeconds <= 0 || def.UsedPercent == nil || !nonnegative(*def.UsedPercent) || *def.UsedPercent > 100 || def.EndMS == nil {
+			continue
+		}
+		kind := "secondary"
+		if *def.DurationSeconds == 18000 {
+			kind = "primary"
+		}
+		if kinds[kind] {
+			return section[*quota]{Stale: true, Error: "quota_ambiguous"}
+		}
+		kinds[kind] = true
+		at := def.ObservedAtMS
+		if source, ok := def.FieldSources["quota"]; ok {
+			at = source.ObservedAtMS
+		}
+		if at <= 0 || at > now {
+			return section[*quota]{Stale: true, Error: "quota_time_invalid"}
+		}
+		if result.ObservedAtMS == 0 || at < result.ObservedAtMS {
+			result.ObservedAtMS = at
+		}
+		if def.Stale == nil || *def.Stale || def.Availability != "active" || *def.EndMS <= now {
+			result.Error = "quota_stale"
+		}
+		if def.Plan != "" {
+			q.Plan = def.Plan
+		}
+		q.Windows = append(q.Windows, window{Kind: kind, DurationSeconds: *def.DurationSeconds, UsedPercent: *def.UsedPercent, RemainingPercent: 100 - *def.UsedPercent, ResetAtMS: *def.EndMS})
+		blocked = blocked || *def.UsedPercent >= 100
+	}
+	if len(q.Windows) > 0 {
+		allowed := !blocked
+		q.Allowed, q.LimitReached = &allowed, &blocked
+		result.Data = q
+		if result.Error == "quota_not_observed" {
+			result.Error = ""
+			result.Stale = false
+		}
+	}
+	return result
 }

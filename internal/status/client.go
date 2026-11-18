@@ -48,7 +48,7 @@ func (c *managerClient) read(ctx context.Context, path string, body any, target 
 	}
 	allowed := map[string]bool{"/v0/management/auth-files": false, "/v0/management/auth-files/models": false,
 		"/usage-service/quota-cooldowns": false, "/v0/management/model-prices": false,
-		"/v0/management/monitoring/analytics": true, "/v0/management/api-call": true,
+		"/v0/management/monitoring/analytics":  true,
 		"/v0/management/quota-snapshots/query": true, "/v0/management/monitoring/account-window-usage": true}
 	post, ok := allowed[u.Path]
 	if !ok || post != (body != nil) {
@@ -58,11 +58,6 @@ func (c *managerClient) read(ctx context.Context, path string, body any, target 
 		return "request_invalid"
 	}
 	return c.request(ctx, path, body, target)
-}
-
-// 唯一写入口只接收采集器生成的额度观测，不开放任意路径或客户端载荷。
-func (c *managerClient) saveQuota(ctx context.Context, entries []quotaWrite, target any) string {
-	return c.request(ctx, "/v0/management/quota-snapshots", map[string]any{"entries": entries}, target)
 }
 
 func (c *managerClient) request(ctx context.Context, path string, body any, target any) string {

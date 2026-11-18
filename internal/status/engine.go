@@ -31,6 +31,7 @@ type flight struct {
 }
 type engine struct {
 	client                        *managerClient
+	storedQuota                   func() map[string]StoredQuota
 	clientHash                    string
 	token                         [32]byte
 	now                           func() time.Time
@@ -105,15 +106,15 @@ func (e *engine) handle(req managementRequest) managementResponse {
 	}
 	force := false
 	for k, v := range req.Query {
+		if k == "cached" && len(v) == 1 && v[0] == "1" {
+			continue
+		}
 		if k != "refresh" || len(v) != 1 || v[0] != "1" {
 			return response(400, map[string]string{"error": "query_invalid"})
 		}
 		force = true
 	}
-	value, limited := e.get(force)
-	if limited {
-		return response(429, map[string]any{"error": "refresh_rate_limited", "retry_after_seconds": 5})
-	}
+	value := e.get(force)
 	// 复制后再标记跨周期数据，不能篡改共享缓存或制造新的额度观测时间。
 	raw, _ := json.Marshal(value)
 	var out snapshot
@@ -136,17 +137,17 @@ func (e *engine) handle(req managementRequest) managementResponse {
 	return response(200, map[string]any{"served_at_ms": now, "snapshot": out})
 }
 
-func (e *engine) get(force bool) (*snapshot, bool) {
+func (e *engine) get(force bool) *snapshot {
 	e.mu.Lock()
 	if e.lifecycle.Err() != nil {
 		e.mu.Unlock()
-		return &snapshot{SchemaVersion: 2, ClientScope: e.opaque("client", e.clientHash), GeneratedAtMS: e.now().UnixMilli(), Accounts: section[[]account]{Stale: true, Error: "configuration_changed"}}, false
+		return &snapshot{SchemaVersion: 2, ClientScope: e.opaque("client", e.clientHash), GeneratedAtMS: e.now().UnixMilli(), Accounts: section[[]account]{Stale: true, Error: "configuration_changed"}}
 	}
 	if e.running != nil {
 		running := e.running
 		e.mu.Unlock()
 		<-running.done
-		return running.value, false
+		return running.value
 	}
 	now := e.now().UnixMilli()
 	if e.last != nil {
@@ -162,19 +163,14 @@ func (e *engine) get(force bool) (*snapshot, bool) {
 				}
 			}
 		}
-		if force && age >= 0 && age < 5000 {
-			e.mu.Unlock()
-			return nil, true
-		}
 		if age >= 0 && !force && ((e.last.Complete && !expired && freshAge >= 0 && freshAge < 60000) || age < 5000) {
 			value := e.last
 			e.mu.Unlock()
-			return value, false
+			return value
 		}
 	}
 	running := &flight{done: make(chan struct{})}
 	e.running = running
-	previous := e.last
 	e.mu.Unlock()
 	value := func() (result *snapshot) {
 		// 即使内部异常也收尾在途请求，避免后续读取永久等待。
@@ -183,7 +179,7 @@ func (e *engine) get(force bool) (*snapshot, bool) {
 				result = &snapshot{SchemaVersion: 2, ClientScope: e.opaque("client", e.clientHash), GeneratedAtMS: e.now().UnixMilli(), RefreshAfterSeconds: 60, Accounts: section[[]account]{Stale: true, Error: "collection_failed"}, Cooldowns: section[[]cooldown]{Stale: true, Error: "collection_failed"}, Recent: section[*recent]{Stale: true, Error: "collection_failed"}, Prices: section[map[string]map[string]any]{Stale: true, Error: "collection_failed"}}
 			}
 		}()
-		return e.collect(previous)
+		return e.collect()
 	}()
 	e.mu.Lock()
 	e.last = value
@@ -191,5 +187,5 @@ func (e *engine) get(force bool) (*snapshot, bool) {
 	e.running = nil
 	close(running.done)
 	e.mu.Unlock()
-	return value, false
+	return value
 }

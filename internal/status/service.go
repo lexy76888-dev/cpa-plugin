@@ -12,13 +12,14 @@ type Service struct {
 }
 
 // Reconfigure 先撤销旧授权并收尾采集，配置无效时保持不可用。
-func (s *Service) Reconfigure() {
+func (s *Service) Reconfigure(stored func() map[string]StoredQuota) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.closeLocked()
 	c, key, token, err := loadConfig(configurationPath())
 	if err == nil {
 		s.engine = newEngine(c, key, token)
+		s.engine.storedQuota = stored
 	}
 }
 
